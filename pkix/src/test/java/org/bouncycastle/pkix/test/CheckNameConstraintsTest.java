@@ -28,7 +28,9 @@ import java.util.List;
 import java.util.Set;
 
 import junit.framework.TestCase;
+import org.bouncycastle.asn1.ASN1Sequence;
 import org.bouncycastle.asn1.x500.X500Name;
+import org.bouncycastle.asn1.x500.style.RFC4519Style;
 import org.bouncycastle.asn1.x509.BasicConstraints;
 import org.bouncycastle.asn1.x509.Extension;
 import org.bouncycastle.asn1.x509.GeneralName;
@@ -42,8 +44,11 @@ import org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder;
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
 import org.bouncycastle.operator.ContentSigner;
 import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder;
+import org.bouncycastle.pkix.PKIXNameConstraintValidator;
+import org.bouncycastle.pkix.PKIXNameConstraintValidatorException;
 import org.bouncycastle.pkix.jcajce.PKIXCertPathReviewer;
 import org.bouncycastle.pkix.util.ErrorBundle;
+import org.bouncycastle.util.Properties;
 
 /**
  * Name constraint checking in the {@link PKIXCertPathReviewer} must not process an unbounded number
@@ -574,6 +579,305 @@ public class CheckNameConstraintsTest
         assertTrue("pkix reviewer rejected a compliant leaf, got " + errorIds(reviewer),
             reviewer.isValidCertPath());
     }
+
+    /**
+     * A directoryName permitted constraint must match as an INITIAL PREFIX of the subject
+     * (RFC 5280 4.2.1.10), not as a subsequence at an arbitrary offset. Prepending an RDN ahead
+     * of the permitted sequence must not satisfy the constraint.
+     */
+    public void testDirectoryNamePrependedRdnBypass()
+        throws Exception
+    {
+        GeneralName permittedDN = new GeneralName(GeneralName.directoryName,
+            new X500Name(RFC4519Style.INSTANCE, "ou=permittedSubtree1, o=Test Certificates 2011, c=US"));
+        GeneralName prefixSubject = new GeneralName(GeneralName.directoryName,
+            new X500Name(RFC4519Style.INSTANCE, "cn=Valid DN nameConstraints EE Certificate Test1, ou=permittedSubtree1, o=Test Certificates 2011, c=US"));
+        GeneralName prependedSubject = new GeneralName(GeneralName.directoryName,
+            new X500Name(RFC4519Style.INSTANCE, "cn=Valid DN nameConstraints EE Certificate Test1, ou=permittedSubtree1, o=Test Certificates 2011, c=US, o=Injected"));
+
+        assertTrue("prefix subject must be permitted", isPermitted(permittedDN, prefixSubject));
+        assertFalse("subject with an RDN prepended before the permitted sequence must NOT be permitted",
+            isPermitted(permittedDN, prependedSubject));
+
+        GeneralName trustedOrg = directoryName("C=US,O=TrustedOrg");
+        assertTrue("subject under the permitted prefix must be permitted",
+            isPermitted(trustedOrg, directoryName("C=US,O=TrustedOrg,CN=victim")));
+        assertFalse("C=FR,O=Attacker prepended ahead of the permitted subtree must NOT be permitted",
+            isPermitted(trustedOrg, directoryName("C=FR,O=Attacker,C=US,O=TrustedOrg,CN=victim")));
+
+        // the checkPermittedDN entry point used for a certificate's subject DN
+        PKIXNameConstraintValidator validator = new PKIXNameConstraintValidator();
+        validator.intersectPermittedSubtree(new GeneralSubtree(trustedOrg));
+        validator.checkPermittedDN(dnSequence("C=US,O=TrustedOrg,CN=victim"));
+        try
+        {
+            validator.checkPermittedDN(dnSequence("C=FR,O=Attacker,C=US,O=TrustedOrg,CN=victim"));
+            fail("subject DN with a prepended RDN must not be permitted");
+        }
+        catch (PKIXNameConstraintValidatorException e)
+        {
+            // expected
+        }
+
+        // excluded subtrees still catch a subject that starts with the excluded sequence
+        assertTrue("subject under an excluded prefix must be excluded",
+            isExcluded(directoryName("C=US,O=Evil Corp"), directoryName("C=US,O=Evil Corp,CN=attacker")));
+    }
+
+    /**
+     * The relaxed anywhere-match that GSMA SGP.22 (eUICC) chains rely on remains available as an
+     * explicit opt-in through the org.bouncycastle.x509.sgp22_name_constraints property.
+     */
+    public void testDirectoryNameSGP22OptIn()
+        throws Exception
+    {
+        String sgp22Property = "org.bouncycastle.x509.sgp22_name_constraints";
+
+        GeneralName trustedOrg = directoryName("C=US,O=TrustedOrg");
+        GeneralName prependedSubject = directoryName("C=FR,O=Attacker,C=US,O=TrustedOrg,CN=victim");
+
+        assertFalse("RFC 5280 prefix matching applies by default", isPermitted(trustedOrg, prependedSubject));
+
+        Properties.setThreadOverride(sgp22Property, true);
+        try
+        {
+            assertTrue("the SGP.22 opt-in must restore the relaxed directoryName match",
+                isPermitted(trustedOrg, prependedSubject));
+        }
+        finally
+        {
+            Properties.removeThreadOverride(sgp22Property);
+        }
+
+        assertFalse("RFC 5280 prefix matching applies once the opt-in is removed",
+            isPermitted(trustedOrg, prependedSubject));
+    }
+
+    /**
+     * An RFC 1034 root-label trailing dot must not let a host escape an excluded rfc822Name, URI
+     * or dNSName subtree.
+     */
+    public void testTrailingDotBypass()
+        throws Exception
+    {
+        PKIXNameConstraintValidator emailV = new PKIXNameConstraintValidator();
+        emailV.addExcludedSubtree(new GeneralSubtree(new GeneralName(GeneralName.rfc822Name, "bank.com")));
+        try
+        {
+            emailV.checkExcluded(new GeneralName(GeneralName.rfc822Name, "ceo@bank.com."));
+            fail("trailing-dot email must be caught by the excluded bank.com subtree");
+        }
+        catch (PKIXNameConstraintValidatorException e)
+        {
+            // expected
+        }
+
+        PKIXNameConstraintValidator uriV = new PKIXNameConstraintValidator();
+        uriV.addExcludedSubtree(new GeneralSubtree(new GeneralName(GeneralName.uniformResourceIdentifier, "competitor.example")));
+        try
+        {
+            uriV.checkExcluded(new GeneralName(GeneralName.uniformResourceIdentifier, "https://competitor.example./"));
+            fail("trailing-dot URI host must be caught by the excluded competitor.example subtree");
+        }
+        catch (PKIXNameConstraintValidatorException e)
+        {
+            // expected
+        }
+
+        // the remaining constraint forms of each name type
+        assertTrue("trailing-dot mailbox must be excluded",
+            isExcluded(emailName("ceo@bank.com"), emailName("ceo@bank.com.")));
+        assertTrue("trailing-dot mail host in an excluded domain must be excluded",
+            isExcluded(emailName(".bank.com"), emailName("ceo@mail.bank.com.")));
+        assertTrue("trailing-dot URI host in an excluded domain must be excluded",
+            isExcluded(uriName(".competitor.example"), uriName("https://www.competitor.example./")));
+        assertTrue("trailing-dot dNSName must be excluded",
+            isExcluded(dnsName("example.com"), dnsName("example.com.")));
+        assertTrue("trailing-dot dNSName in an excluded domain must be excluded",
+            isExcluded(dnsName("example.com"), dnsName("host.example.com.")));
+
+        // the canonicalisation applies to the permitted direction too, and admits nothing new
+        assertTrue("trailing-dot mail host must be permitted",
+            isPermitted(emailName("bank.com"), emailName("ceo@bank.com.")));
+        assertTrue("trailing-dot URI host must be permitted",
+            isPermitted(uriName("competitor.example"), uriName("https://competitor.example./")));
+        assertTrue("trailing-dot dNSName must be permitted",
+            isPermitted(dnsName("example.com"), dnsName("host.example.com.")));
+        assertFalse("trailing-dot dNSName outside the permitted subtree must not be permitted",
+            isPermitted(dnsName("example.com"), dnsName("evil.com.")));
+        assertFalse("trailing-dot mail host outside the permitted subtree must not be permitted",
+            isPermitted(emailName("bank.com"), emailName("ceo@evil.com.")));
+    }
+
+    /**
+     * Only the single root-label dot of RFC 1034 sec. 3.1 is canonicalized away. A host carrying any
+     * other empty label - a second trailing dot, a doubled dot, a leading dot - is not a name
+     * RFC 5280 sec. 4.2.1.6 admits, and stripping the extra dots would decide on the caller's behalf
+     * that "example.com.." names example.com. It is refused instead, in both directions, so it can
+     * neither escape an excluded subtree nor be admitted by a permitted one.
+     */
+    public void testEmptyLabelRefused()
+        throws Exception
+    {
+        // dNSName: every shape of empty label is refused, whichever domain the name appears to carry.
+        assertTrue("two trailing dots must be refused",
+            isExcluded(dnsName("example.com"), dnsName("example.com..")));
+        assertTrue("three trailing dots must be refused",
+            isExcluded(dnsName("example.com"), dnsName("example.com...")));
+        assertTrue("a doubled inner dot must be refused",
+            isExcluded(dnsName("example.com"), dnsName("foo..example.com")));
+        assertTrue("a leading dot must be refused",
+            isExcluded(dnsName("example.com"), dnsName(".example.com")));
+        assertTrue("a sibling domain with an empty label must be refused too",
+            isExcluded(dnsName("example.com"), dnsName("notexample.com..")));
+
+        // the permitted direction refuses it as well, so canonicalizing has not admitted anything new.
+        assertFalse("an empty label must not be permitted",
+            isPermitted(dnsName("example.com"), dnsName("example.com..")));
+        assertTrue("a well-formed name is still permitted",
+            isPermitted(dnsName("example.com"), dnsName("example.com.")));
+
+        // rfc822Name and URI share the guard, applied to the host.
+        assertTrue("two trailing dots on a mail host must be refused",
+            isExcluded(emailName("bank.com"), emailName("ceo@bank.com..")));
+        assertTrue("two trailing dots on a URI host must be refused",
+            isExcluded(uriName("competitor.example"), uriName("https://competitor.example../")));
+        assertFalse("an empty label in a mail host must not be permitted",
+            isPermitted(emailName("bank.com"), emailName("ceo@bank..com")));
+        assertFalse("an empty label in a URI host must not be permitted",
+            isPermitted(uriName("competitor.example"), uriName("https://competitor..example/")));
+
+        // the guard is scoped to the host: a quoted local part may legally carry a doubled dot.
+        assertTrue("a doubled dot in a quoted local part must not be refused, and the host still matches",
+            isExcluded(emailName("bank.com"), emailName("\"a..b\"@bank.com")));
+
+        // a bare "." is the root label, not an empty one, and is left alone.
+        assertFalse("a bare root label must not be refused", isExcluded(dnsName("example.com"), dnsName(".")));
+
+        // nothing is refused where no constraint of that type is in force.
+        assertFalse("an empty label is immaterial with no dNSName constraint",
+            isExcluded(emailName("bank.com"), dnsName("example.com..")));
+    }
+
+    /**
+     * End to end through the PKIXCertPathReviewer: a leaf issued by a name-constrained CA must not
+     * escape the CA's constraints by prepending RDNs to its subject, or with a trailing dot or an
+     * empty label on a subject alternative name.
+     */
+    public void testReviewerRejectsNameConstraintBypasses()
+        throws Exception
+    {
+        Security.addProvider(new BouncyCastleProvider());
+
+        KeyPair ncRootKp = generateKeyPair();
+        KeyPair ncIntKp = generateKeyPair();
+
+        X500Name rootDn = new X500Name("CN=NC Test Root CA");
+        X500Name intDn = new X500Name("CN=NC Constrained Intermediate CA");
+
+        X509Certificate rootCert = generateRoot(rootDn, ncRootKp);
+
+        Set trust = new HashSet();
+        trust.add(new TrustAnchor(rootCert, null));
+
+        // subject DN with RDNs prepended ahead of the permitted directoryName subtree
+        GeneralSubtree permittedDn = new GeneralSubtree(
+            new GeneralName(new X500Name("C=US,O=Partner A")));
+        X509Certificate dnCA = generateConstrainedCA(rootDn, ncRootKp, intDn, ncIntKp,
+            new NameConstraints(new GeneralSubtree[]{permittedDn}, null));
+
+        assertReviewerRejected(trust, generatePath(intDn, ncIntKp, dnCA,
+            new X500Name("C=FR,O=Attacker,C=US,O=Partner A,CN=attacker"), null), "CertPathReviewer.notPermittedDN");
+        assertLeafAccepted(trust, generatePath(intDn, ncIntKp, dnCA,
+            new X500Name("C=US,O=Partner A,CN=host"), null));
+
+        // SAN in an excluded dNSName / rfc822Name subtree, disguised with a trailing dot or an empty label
+        GeneralSubtree excludedDns = new GeneralSubtree(new GeneralName(GeneralName.dNSName, "evil.com"));
+        GeneralSubtree excludedEmail = new GeneralSubtree(new GeneralName(GeneralName.rfc822Name, "evil.com"));
+        X509Certificate exCA = generateConstrainedCA(rootDn, ncRootKp, intDn, ncIntKp,
+            new NameConstraints(null, new GeneralSubtree[]{excludedDns, excludedEmail}));
+
+        assertReviewerRejected(trust, generatePath(intDn, ncIntKp, exCA, new X500Name("CN=attacker"),
+            new GeneralNames(new GeneralName(GeneralName.dNSName, "attacker.evil.com."))),
+            "CertPathReviewer.notPermittedEmail");
+        assertReviewerRejected(trust, generatePath(intDn, ncIntKp, exCA, new X500Name("CN=attacker"),
+            new GeneralNames(new GeneralName(GeneralName.dNSName, "attacker..evil.com"))),
+            "CertPathReviewer.notPermittedEmail");
+        assertReviewerRejected(trust, generatePath(intDn, ncIntKp, exCA, new X500Name("CN=attacker"),
+            new GeneralNames(new GeneralName(GeneralName.rfc822Name, "ceo@evil.com."))),
+            "CertPathReviewer.notPermittedEmail");
+        assertLeafAccepted(trust, generatePath(intDn, ncIntKp, exCA, new X500Name("CN=host"),
+            new GeneralNames(new GeneralName(GeneralName.dNSName, "host.partner-a.example.com."))));
+    }
+
+    private static void assertReviewerRejected(Set trust, CertPath path, String errorId)
+        throws Exception
+    {
+        PKIXParameters param = new PKIXParameters(trust);
+        param.setRevocationEnabled(false);
+
+        PKIXCertPathReviewer reviewer = new PKIXCertPathReviewer();
+        reviewer.init(path, param);
+        assertFalse("pkix reviewer accepted a name-constraint-violating leaf", reviewer.isValidCertPath());
+        assertTrue("pkix reviewer did not report " + errorId + " against the leaf, got " + errorIds(reviewer),
+            hasError(reviewer, 0, errorId));
+    }
+
+    private static boolean isPermitted(GeneralName permitted, GeneralName subject)
+    {
+        PKIXNameConstraintValidator validator = new PKIXNameConstraintValidator();
+        validator.intersectPermittedSubtree(new GeneralSubtree(permitted));
+        try
+        {
+            validator.checkPermitted(subject);
+            return true;
+        }
+        catch (PKIXNameConstraintValidatorException e)
+        {
+            return false;
+        }
+    }
+
+    private static boolean isExcluded(GeneralName excluded, GeneralName name)
+    {
+        PKIXNameConstraintValidator validator = new PKIXNameConstraintValidator();
+        validator.addExcludedSubtree(new GeneralSubtree(excluded));
+        try
+        {
+            validator.checkExcluded(name);
+            return false;
+        }
+        catch (PKIXNameConstraintValidatorException e)
+        {
+            return true;
+        }
+    }
+
+    private static GeneralName directoryName(String name)
+    {
+        return new GeneralName(GeneralName.directoryName, new X500Name(name));
+    }
+
+    private static ASN1Sequence dnSequence(String name)
+    {
+        return ASN1Sequence.getInstance(new X500Name(name).toASN1Primitive());
+    }
+
+    private static GeneralName dnsName(String dns)
+    {
+        return new GeneralName(GeneralName.dNSName, dns);
+    }
+
+    private static GeneralName emailName(String email)
+    {
+        return new GeneralName(GeneralName.rfc822Name, email);
+    }
+
+    private static GeneralName uriName(String uri)
+    {
+        return new GeneralName(GeneralName.uniformResourceIdentifier, uri);
+    }
+
     private static X509Certificate sign(JcaX509v3CertificateBuilder builder, PrivateKey signerKey)
         throws Exception
     {
